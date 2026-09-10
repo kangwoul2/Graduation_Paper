@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'research_v2/**'
+      - '1.used_data/**'
       - '3.Labeled_data/BTC_ohlcv_data_Labeled.csv'
       - 'requirements-research-v2.txt'
       - '.github/workflows/research-v2.yml'
@@ -13,7 +14,7 @@ on:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -30,15 +31,22 @@ jobs:
         run: pip install -r requirements-research-v2.txt
 
       - name: Compile research code
-        run: python -m py_compile research_v2/run_research.py
+        run: |
+          python -m py_compile research_v2/run_research.py
+          python -m py_compile research_v2/run_extended_research.py
 
-      - name: Run reproducible benchmark
+      - name: Run leakage-safe three-class benchmark
         run: python research_v2/run_research.py
+
+      - name: Run cross-market and high-conviction benchmark
+        run: python research_v2/run_extended_research.py
 
       - name: Upload research results
         uses: actions/upload-artifact@v4
         with:
           name: research-v2-results
-          path: research_v2/results/
+          path: |
+            research_v2/results/
+            research_v2/results_extended/
           if-no-files-found: error
           retention-days: 30
