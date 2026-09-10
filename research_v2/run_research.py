@@ -58,13 +58,15 @@ def load_frame() -> pd.DataFrame:
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"missing columns: {sorted(missing)}")
+    if not set(df["label"].dropna().astype(int).unique()).issubset(set(LABELS)):
+        raise ValueError("label must be one of -1, 0, 1")
     return df
 
 
 def build_stationary_features(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
 
-    # Lagged returns use only information available at or before time t.
+    # Features must use information available at or before time t.
     for lag in (1, 2, 3, 5, 10):
         out[f"return_{lag}d"] = df["close"].pct_change(lag)
 
@@ -72,11 +74,11 @@ def build_stationary_features(df: pd.DataFrame) -> pd.DataFrame:
     out["range_pct"] = safe_div(df["high"] - df["low"], df["close"])
     out["volume_log_change"] = np.log1p(df["volume"]).diff()
 
+    # Convert level-dependent indicators into relative, more stationary features.
     out["close_sma_gap"] = safe_div(df["close"], df["sma_50"]) - 1
     out["close_ema_gap"] = safe_div(df["close"], df["ema_20"]) - 1
     out["close_wma_gap"] = safe_div(df["close"], df["wma_20"]) - 1
     out["close_tema_gap"] = safe_div(df["close"], df["tema_20"]) - 1
-
     out["macd_pct"] = safe_div(df["macd"], df["close"])
     out["macd_signal_pct"] = safe_div(df["macd_signal"], df["close"])
     out["macd_hist_pct"] = safe_div(df["macd_hist"], df["close"])
@@ -86,11 +88,11 @@ def build_stationary_features(df: pd.DataFrame) -> pd.DataFrame:
     out["roc"] = df["roc"] / 100.0
     out["cci_14"] = df["cci_14"] / 200.0
     out["willr_14"] = df["willr_14"] / 100.0
-
     out["bb_position"] = safe_div(df["close"] - df["lower_bb"], df["upper_bb"] - df["lower_bb"])
     out["bb_width"] = safe_div(df["upper_bb"] - df["lower_bb"], df["middle_bb"])
 
-    # Raw return in the legacy file is the next-day target return and must never be used as an input feature.
+    # IMPORTANT: df['return'] is the next-day target return created with shift(-1) in the legacy notebook.
+    # It is intentionally excluded to prevent target leakage.
     return out.replace([np.inf, -np.inf], np.nan)
 
 
@@ -123,15 +125,16 @@ def chronological_split(X: pd.DataFrame, y: pd.Series, train_ratio: float = 0.6,
 
 
 def metric_row(name: str, y_true: pd.Series | np.ndarray, y_pred: np.ndarray) -> dict:
+    per_class_recall = recall_score(y_true, y_pred, labels=LABELS, average=None, zero_division=0)
     return {
         "model": name,
         "accuracy": accuracy_score(y_true, y_pred),
         "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
         "macro_f1": f1_score(y_true, y_pred, average="macro", zero_division=0),
         "weighted_f1": f1_score(y_true, y_pred, average="weighted", zero_division=0),
-        "recall_down": recall_score(y_true, y_pred, labels=LABELS, average=None, zero_division=0)[0],
-        "recall_neutral": recall_score(y_true, y_pred, labels=LABELS, average=None, zero_division=0)[1],
-        "recall_up": recall_score(y_true, y_pred, labels=LABELS, average=None, zero_division=0)[2],
+        "recall_down": per_class_recall[0],
+        "recall_neutral": per_class_recall[1],
+        "recall_up": per_class_recall[2],
     }
 
 
@@ -236,30 +239,32 @@ def selective_curve(model, X_test: pd.DataFrame, y_test: pd.Series) -> pd.DataFr
     rows = []
     for threshold in np.arange(0.35, 0.81, 0.05):
         mask = confidence >= threshold
-        coverage = float(mask.mean())
         if mask.sum() < 20:
             continue
+        y_selected = y_test.iloc[np.flatnonzero(mask)]
+        pred_selected = pred[mask]
         rows.append({
             "threshold": round(float(threshold), 2),
-            "coverage": coverage,
+            "coverage": float(mask.mean()),
             "selected_samples": int(mask.sum()),
-            "accuracy": accuracy_score(y_test.iloc[np.flatnonzero(mask)], pred[mask]),
-            "balanced_accuracy": balanced_accuracy_score(y_test.iloc[np.flatnonzero(mask)], pred[mask]),
-            "macro_f1": f1_score(y_test.iloc[np.flatnonzero(mask)], pred[mask], average="macro", zero_division=0),
+            "accuracy": accuracy_score(y_selected, pred_selected),
+            "balanced_accuracy": balanced_accuracy_score(y_selected, pred_selected),
+            "macro_f1": f1_score(y_selected, pred_selected, average="macro", zero_division=0),
         })
     return pd.DataFrame(rows)
 
 
 def plot_results(comparison: pd.DataFrame, selective: pd.DataFrame) -> None:
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    ordered = comparison.sort_values("macro_f1", ascending=False)
-    fig, ax = plt.subplots(figsize=(9, 5))
+    ordered = comparison.sort_values("macro_f1", ascending=False).copy()
+    ordered["display"] = ordered["feature_set"] + "\n" + ordered["model"]
+    fig, ax = plt.subplots(figsize=(10, 5))
     x = np.arange(len(ordered))
     width = 0.36
     ax.bar(x - width / 2, ordered["balanced_accuracy"], width, label="Balanced Accuracy")
     ax.bar(x + width / 2, ordered["macro_f1"], width, label="Macro F1")
     ax.set_xticks(x)
-    ax.set_xticklabels(ordered["model"], rotation=18, ha="right")
+    ax.set_xticklabels(ordered["display"], rotation=12, ha="right")
     ax.set_ylim(0, 1)
     ax.set_title("Leakage-safe chronological holdout")
     ax.legend()
@@ -268,27 +273,20 @@ def plot_results(comparison: pd.DataFrame, selective: pd.DataFrame) -> None:
     plt.close(fig)
 
     if not selective.empty:
-        fig, ax1 = plt.subplots(figsize=(8, 5))
-        ax1.plot(selective["coverage"], selective["accuracy"], marker="o", label="Accuracy")
-        ax1.plot(selective["coverage"], selective["macro_f1"], marker="s", label="Macro F1")
-        ax1.set_xlabel("Coverage")
-        ax1.set_ylabel("Score")
-        ax1.set_ylim(0, 1)
-        ax1.set_title("Confidence threshold: quality vs coverage")
-        ax1.legend()
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(selective["coverage"], selective["accuracy"], marker="o", label="Accuracy")
+        ax.plot(selective["coverage"], selective["macro_f1"], marker="s", label="Macro F1")
+        ax.set_xlabel("Coverage")
+        ax.set_ylabel("Score")
+        ax.set_ylim(0, 1)
+        ax.set_title("Confidence threshold: quality vs coverage")
+        ax.legend()
         fig.tight_layout()
         fig.savefig(RESULT_DIR / "selective_prediction.png", dpi=160)
         plt.close(fig)
 
 
-def write_summary(
-    feature_set: str,
-    test_metrics: dict,
-    dummy_metrics: dict,
-    walk: pd.DataFrame,
-    selective: pd.DataFrame,
-    class_counts: dict,
-) -> None:
+def write_summary(feature_set: str, test_metrics: dict, dummy_metrics: dict, walk: pd.DataFrame, selective: pd.DataFrame, class_counts: dict) -> None:
     macro_gain = test_metrics["macro_f1"] - dummy_metrics["macro_f1"]
     bal_gain = test_metrics["balanced_accuracy"] - dummy_metrics["balanced_accuracy"]
     lines = [
@@ -314,7 +312,7 @@ def write_summary(
             lines.extend([
                 "## Selective prediction",
                 "",
-                "When the system is allowed to abstain on low-confidence days, quality can be traded for coverage.",
+                "Low-confidence days may be rejected instead of forcing every day into a trading signal.",
                 f"- Best accuracy with coverage >= 20%: `{best['accuracy']:.4f}`",
                 f"- Coverage: `{best['coverage']:.4f}`",
                 f"- Confidence threshold: `{best['threshold']:.2f}`",
@@ -374,7 +372,7 @@ def main() -> None:
         ablation_rows.append(row)
 
     ablation = pd.DataFrame(ablation_rows).sort_values("macro_f1", ascending=False)
-    best_feature = ablation.iloc[0]["feature_set"]
+    best_feature = str(ablation.iloc[0]["feature_set"])
     best = next(o for o in outcomes if o["feature_set"] == best_feature)
 
     validation_frames = []
@@ -382,21 +380,15 @@ def main() -> None:
         frame = outcome["validation"].copy()
         frame.insert(0, "feature_set", outcome["feature_set"])
         validation_frames.append(frame)
+
     pd.concat(validation_frames, ignore_index=True).to_csv(RESULT_DIR / "validation_model_selection.csv", index=False)
     ablation.to_csv(RESULT_DIR / "model_comparison.csv", index=False)
     best["walk"].to_csv(RESULT_DIR / "walk_forward.csv", index=False)
     best["selective"].to_csv(RESULT_DIR / "selective_prediction.csv", index=False)
     best["confusion"].to_csv(RESULT_DIR / "confusion_matrix.csv")
 
-    plot_results(ablation.rename(columns={"feature_set": "model"}), best["selective"])
-    write_summary(
-        str(best_feature),
-        best["test_metrics"],
-        best["dummy_metrics"],
-        best["walk"],
-        best["selective"],
-        class_counts,
-    )
+    plot_results(ablation, best["selective"])
+    write_summary(best_feature, best["test_metrics"], best["dummy_metrics"], best["walk"], best["selective"], class_counts)
 
     metadata = {
         "data_path": str(DATA_PATH),
@@ -408,7 +400,6 @@ def main() -> None:
         "target_column_excluded": "return (legacy file contains next-day target return)",
     }
     (RESULT_DIR / "protocol.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
     print((RESULT_DIR / "summary.md").read_text(encoding="utf-8"))
 
 
